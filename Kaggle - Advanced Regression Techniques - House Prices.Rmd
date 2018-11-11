@@ -1,0 +1,449 @@
+---
+title: "Kaggle House Prices"
+author: "Greg D"
+date: "August 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Kaggle - House Prices - Advanced Regression Techniques
+
+### Introduction
+
+This kaggle competition is based on the Ames Housing dataset (http://www.amstat.org/publications/jse/v19n3/decock.pdf). It provides both a training set which includes sale prices and a test set without sale prices, the predictions for which are to be submitted for ranking. 
+
+The training data is preprocessed, divided into training and validation sets, and then multiple regression models are trained and compared. The competition rank is based on the Root Mean Square Logarithmic Error, so that is the metric upon which the models will be compared. 
+
+
+Firstly, import the required libraries and read in the data files:
+```{r}
+options(java.parameters = "-Xmx1024m")
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(MLmetrics)
+
+#Performance of many caret functions can be improved through parallel processing
+#Limited to 3 here due to memory constraints, but detecting cores may be suitable on a different system :
+library(doParallel) 
+cl <- makeCluster(3, type='PSOCK')
+registerDoParallel(cl)
+
+
+#Read in data files
+training = read.csv('train.csv')
+testing = read.csv('test.csv')
+```
+
+
+### Preview of the data
+Let's have a quick look at the data:
+```{R}
+dim(training)
+dim(testing)
+head(training)
+head(testing)
+summary(training)
+```
+A few things to note: We have NA's in many categories. We have some features that contain almost no data ('PoolQC', for instance, has 7 legitimate values and 1453 NA's). Note that the testing dataset does not contain SalePrice information, as it was intended to assess performance in the Kaggle competition. We'll preprocess the training set as required, performing the same functions on the testing set as we go.
+
+```{R}
+h = ggplot(training, aes(x = SalePrice))
+h = h + geom_histogram()
+h
+```
+Note there are very few datapoints for sales above $500000, so our model may not generalise well at this end of the market.Some of the linear models may perform better if the values at the extreme high end are removed, but we'll leave them in for now. 
+
+###Pre-processing the Data
+
+From the data descriptions, NA is used as a legitimate value in many factor columns to indicate the lack of a feature, such as a pool. 
+
+Let's find any Factor columns that contain NAs, so we can convert the NAs to their own factor:
+
+```{R}
+#First Find Factor Cols and standardise N/As
+trainingfct = training %>% select_if(is.factor) %>% lapply(addNA) %>% replace(.,is.na(.),"")
+testingfct = testing %>% select_if(is.factor) %>% lapply(addNA) %>% replace(.,is.na(.),"")
+
+#Convert NAs in Factor Variables to factor variables
+trainingfct = lapply(trainingfct, addNA)
+testingfct = lapply(testingfct, addNA)
+
+#Recombine Dataset by adding the changed columns of the fct dataframes with the
+#unchanged columns of the original dataframes
+train2 = training[, -which(names(training) %in% names(trainingfct))]
+test2 = testing[, -which(names(testing) %in% names(testingfct))]
+newtraining = cbind(train2, trainingfct)
+newtesting = cbind(test2, testingfct)
+```
+To demonstrate that this has worked, let's compare a factor variable that has been modified. Firstly we need to see which ones they were:
+```{R}
+summary(trainingfct)
+```
+Let's look at PoolQC for both the original and processed datasets, as we noted before there were several NA values in it (which makes sense if N/A is used to indicate 'not present', as many houses do not have pools)
+```{R}
+head(training$PoolQC)
+head(newtraining$PoolQC)
+head(testing$PoolQC)
+head(newtesting$PoolQC)
+```
+We can see that the newtraining table has an additional level 'NA' that did not previously exist. 
+
+We need to convert the factor variables into a numerical format before we feed them into a predictive model. Here they are converted into a one-hot arrangement:
+```{R}
+#Turn Factors into One-Hot
+dmy = dummyVars("~ .", data = newtraining)
+factored_train = data.frame(predict(dmy, newdata = newtraining))
+dmy = dummyVars("~ .", data = newtesting)
+factored_test = data.frame(predict(dmy, newdata = newtesting))
+
+dim(factored_train)
+dim(factored_test)
+```
+We can see that, in converting to a one-hot arrangement, we have produced columns in each set that are not in both sets, because some factors did not exist in each dataset. As there is no point training on data that doesn't exist in the prediction dataset, let's remove columns that don't exist in both sets.
+
+```{R}
+head(factored_train[,"SalePrice"])
+```
+```{R}
+#Save SalePrices so we can put them back later.
+SalePrices = factored_train[,"SalePrice"]
+dim(factored_train)
+factored_train = factored_train[,colnames(factored_train)%in%names(factored_test)]
+dim(factored_train)
+factored_test = factored_test[,colnames(factored_test)%in%names(factored_train)]
+dim(factored_test)
+#Put SalePrices back in
+factored_train["SalePrice"]=SalePrices
+dim(factored_train)
+```
+Perfect, they are the correct length. The training set became one column larger when we added the sale prices back in. 
+
+
+While we've converted the NA's in factor variables into their own factors, there still exist some NA's in the continuous variables. Let's see how many rows still contain NA's:
+
+```{R}
+dim(factored_train[complete.cases(factored_train),])
+dim(factored_train)
+
+dim(factored_test[complete.cases(factored_test),])
+dim(factored_test)
+```
+We can see that 1121 of 1460 rows in the training set are complete. We could discard the incomplete rows, but that is a large portion of our dataset to ignore. Let's impute all non-factor NA values.A similar fraction of the test set are also incomplete. 
+
+```{R}
+#Remove Saleprice from training set - we won't preprocess it
+factored_train_without_saleprice = factored_train %>% select(-"SalePrice")
+#Create preprocesing object and run it on training set
+preObj <- preProcess(factored_train_without_saleprice, method=c('scale','center','knnImpute'))
+train_processed = predict(preObj,factored_train_without_saleprice)
+test_processed = predict(preObj, factored_test)
+#Add back Saleprice to training set
+train_processed["SalePrice"]=factored_train["SalePrice"]
+```
+Note the zero variance warning above. When converting to one-hot format, we've probably created some variables containing zero or very little useful data. Let's have a look:
+```{R}
+nearZeroVarColumns = nearZeroVar(train_processed)
+length(nearZeroVarColumns)
+```
+Quite a few. Let's delete them - They add little information to the model and will, at best, slow down training and may reduce the performance of the model. 
+```{R}
+dim(train_processed)
+train_processed = train_processed[,-nearZeroVarColumns]
+test_processed = test_processed[,-nearZeroVarColumns]
+dim(train_processed)
+dim(test_processed)
+```
+Let's split the dataset into a training set and a validation set:
+
+```{R}
+set.seed(5)
+inTrain = createDataPartition(train_processed$SalePrice, p=0.7,list=FALSE)
+train_set = train_processed[inTrain,]
+val_set = train_processed[-inTrain,]
+
+```
+
+### Training Regression Models
+
+The processed data is used to train a variety of popular regression models, using the caret package. Each model is trained using a random hyperparameter search, which selects the best model through a cross-validation method, or in the case of the linear regression model, using the recursive feature elimination method to select the optimal features to use. All models are trained only using the training set data. 
+
+Each model is then used to predict the SalePrice figures for the test set, and the RMSLE (the metric used by the Kaggle competition for model ranking) for each stored in a dataframe for later comparison. 
+
+Linear Regression:
+
+```{R}
+# define the control using a linear model selection function
+control <- rfeControl(functions=lmFuncs, method="repeatedcv", number=10, repeats=3)
+# run the RFE algorithm
+model.rfe.lm <- rfe(x=train_set[,-which(names(train_set) == "SalePrice")], y=train_set[,"SalePrice"], sizes=seq(1,127, by=1), rfeControl=control)
+# plot the results
+plot(model.rfe.lm, type=c("g", "o"))
+
+#Test performance on the dev set and save RMSLE value in a dataframe.
+predictions.rfe.lm <- predict(model.rfe.lm, val_set)
+models = data.frame('Model'='rfe.lm', 'RMSLE'=RMSLE(predictions.rfe.lm, val_set$SalePrice))
+```
+
+SVM:
+
+```{R}
+fitControl <- trainControl(method = "adaptive_cv", 
+                           number = 5, 
+                           search="random",  
+                           adaptive = list(min = 3, alpha = 0.05, 
+                                             method = "gls", complete = TRUE))
+
+model.svm <- train(SalePrice ~ ., train_set, method='svmLinear',
+                         metric="RMSE",
+                         trControl=fitControl,
+                         tuneLength=25,
+                         verbose=FALSE)
+
+#Print training performance of various hyperparameter combinations.  
+model.svm$results %>% 
+  dplyr::arrange(RMSE) %>% 
+  head(6)
+
+#Test performance on the validation set
+predictions.svm <- predict(model.svm, val_set)
+models = rbind(models, data.frame('Model'='svm', 'RMSLE'=RMSLE(predictions.svm, val_set$SalePrice)))
+
+```
+
+Cubist:
+
+```{R}
+
+fitControl <- trainControl(method = "adaptive_cv", 
+                           number = 5, 
+                           search="random",  
+                           adaptive = list(min = 4, alpha = 0.05, 
+                                             method = "gls", complete = TRUE))
+# tune the model
+model.cubist <- train(SalePrice ~ .,train_set, method='cubist',
+                   metric= "RMSE", 
+                   trControl=fitControl,
+                   tuneLength=25,
+                   verbose=FALSE)
+
+#Print training performance of various hyperparameter combinations.  
+model.cubist$results %>% 
+  dplyr::arrange(RMSE) %>% 
+  head(6)
+
+#Test performance on the dev set
+predictions.cubist <- predict(model.cubist, val_set)
+models = rbind(models, data.frame('Model'='cubist', 'RMSLE'=RMSLE(predictions.cubist, val_set$SalePrice)))
+
+```
+Random_forest:
+
+```{R}
+fitControl <- trainControl(method = "adaptive_cv", 
+                           number = 4, 
+                           search="random",  
+                           adaptive = list(min = 3, alpha = 0.05, 
+                                             method = "gls", complete = TRUE))
+
+# tune the model
+model.rf <- train(SalePrice ~ .,train_set, method='rf',
+                   metric= "RMSE", 
+                   trControl=fitControl,
+                   tuneLength=25,
+                   verbose=FALSE)
+
+#Print training performance of various hyperparameter combinations.  
+model.rf$results %>% 
+  dplyr::arrange(RMSE) %>% 
+  head(6)
+
+#Test performance on the validation set
+predictions.rf <- predict(model.rf, val_set)
+models = rbind(models, data.frame('Model'='random forest', 'RMSLE'=RMSLE(predictions.rf, val_set$SalePrice)))
+
+```
+
+Gradient boosting:
+
+```{R}
+fitControl <- trainControl(method = "adaptive_cv", 
+                           number = 5, 
+                           search="random",  
+                           adaptive = list(min = 4, alpha = 0.05, 
+                                             method = "gls", complete = TRUE))
+
+model.gbm <- train(SalePrice ~ ., train_set, method='gbm',
+                         metric="RMSE",
+                         trControl=fitControl,
+                         tuneLength=30,
+                         verbose=FALSE)
+
+#Print training performance of various hyperparameter combinations.  
+model.gbm$results %>% 
+  dplyr::arrange(RMSE) %>% 
+  head(6)
+
+#Test performance on the validation set
+predictions.gbm<- predict(model.gbm, val_set)
+models = rbind(models, data.frame('Model'='gbm', 'RMSLE'=RMSLE(predictions.gbm, val_set$SalePrice)))
+```
+
+K Nearest Neighbours:
+
+```{R}
+fitControl <- trainControl(method = "adaptive_cv", 
+                           number = 5, 
+                           search="random",  
+                           adaptive = list(min = 3, alpha = 0.05, 
+                                             method = "gls", complete = TRUE))
+
+model.knn <- train(SalePrice ~ ., train_set, method='kknn',
+                         metric="RMSE",
+                         trControl=fitControl,
+                         tuneLength=25,
+                         verbose=FALSE)
+
+#Print training performance of various hyperparameter combinations.  
+model.knn$results %>% 
+  dplyr::arrange(RMSE) %>% 
+  head(6)
+
+#Test performance on the validation set
+predictions.knn <- predict(model.knn, val_set)
+models = rbind(models, data.frame('Model'='knn', 'RMSLE'=RMSLE(predictions.knn, val_set$SalePrice)))
+
+```
+
+### Reviewing the models
+
+```{R}
+models[order(models$RMSLE),]
+
+```
+
+We can see the SVM, cubist, gradient boosting and random forest models provided the greatest performance. Some models improved a little with the hyperparameter tuning, others saw no improvement. 
+
+### Ensemble Model
+
+Let's see if our performance improves if we ensemble the 4 best models (svm, cubist, gbm and rf):
+
+
+```{R}
+#Prepare ensemble training data
+#trainingpredictions.rfe.lm = predict(model.rfe.lm, newdata = train_processed)
+trainingpredictions.randomforest = predict(model.rf, newdata = train_set)
+trainingpredictions.cubist = predict(model.cubist, newdata = train_set)
+trainingpredictions.svm = predict(model.svm, newdata = train_set)
+trainingpredictions.gbm = predict(model.gbm, newdata = train_set)
+
+ensembleTrainingData = data.frame("cubist"=trainingpredictions.cubist,"rf"=trainingpredictions.randomforest, "gbm"=trainingpredictions.gbm, "svm"=trainingpredictions.svm, "SalePrice"=train_set$SalePrice)
+
+# make a grid of values to test
+fitControl <- trainControl(method = "adaptive_cv", 
+                           number = 5, 
+                           search="random",  
+                           adaptive = list(min = 2, alpha = 0.05, 
+                                             method = "gls", complete = TRUE))
+
+# tune the model
+model.ensemble <- train(x=ensembleTrainingData[,-which(names(ensembleTrainingData) == "SalePrice")],    y=ensembleTrainingData[,"SalePrice"], method='gbm',
+                   metric= "RMSE",
+                   trControl=fitControl,
+                   tuneLength=25,
+                   verbose=FALSE)
+
+model.ensemble$results %>% 
+  dplyr::arrange(RMSE) %>% 
+  head(6)
+
+#Prepare ensemble validation data
+#trainingpredictions.rfe.lm = predict(model.rfe.lm, newdata = train_processed)
+validationpredictions.randomforest = predict(model.rf, newdata = val_set)
+validationpredictions.cubist = predict(model.cubist, newdata = val_set)
+validationpredictions.svm = predict(model.svm, newdata = val_set)
+validationpredictions.gbm = predict(model.gbm, newdata = val_set)
+
+ensembleValidationData = data.frame("cubist"=validationpredictions.cubist,"rf"=validationpredictions.randomforest, "gbm"=validationpredictions.gbm, "svm"=validationpredictions.svm, "SalePrice"=val_set$SalePrice)
+
+#Test against the validation set:
+predictions.ensemble <- predict(model.ensemble, ensembleValidationData)
+
+RMSLE(predictions.ensemble, val_set$SalePrice)
+
+#Add performance to dataframe
+models = rbind(models, data.frame('Model'='ensemble', 'RMSLE'=RMSLE(predictions.ensemble, val_set$SalePrice)))
+
+```
+
+Let's have a look at the performance of our models:
+
+```{R}
+plot = ggplot(models[order(models$RMSLE),], aes( reorder(Model, RMSLE), RMSLE))
+plot = plot + geom_bar(stat='identity')+xlab('Model')
+plot = plot + coord_cartesian(ylim=c(0.12,0.2))
+plot = plot + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+plot
+
+
+```
+
+
+Our ensemble model provides no real improvement in performance. Consistently (over several runs) the gbm model provided the best performance. 
+
+### Preparing Submission
+
+Let's retrain the gbm model using the full training set, and then use it to make predictions on the test set. 
+
+
+
+```{R}
+# make a grid of values to test
+grid <- expand.grid(n.trees           = model.gbm$bestTune$n.trees,
+                    shrinkage         = model.gbm$bestTune$shrinkage,
+                    n.minobsinnode    = model.gbm$bestTune$n.minobsinnode,
+                    interaction.depth = model.gbm$bestTune$interaction.depth)
+fitControl <- trainControl(method = "repeatedcv", 
+                           number = 5, repeats=3)
+# tune the model
+model.gbm_fullset <- train(x=train_processed[,-which(names(train_processed) == "SalePrice")],                    y=train_processed[,"SalePrice"], method='gbm',
+                   metric= "RMSE", 
+                   trControl=fitControl,
+                   tuneGrid=grid,
+                   verbose=FALSE)
+
+#Print training performance of various hyperparameter combinations.  
+model.gbm_fullset$results %>% 
+  dplyr::arrange(RMSE) %>% 
+  head(6)
+
+
+
+
+```
+Get test set predictions:
+```{R}
+#Get test set predictions
+
+testpredictions.gbm_fullset = predict(model.gbm_fullset, test_processed)
+
+```
+
+Put the predictions into the appropriate format:
+```{R}
+submission_table=data.frame(Id=testing[,"Id"],SalePrice=testpredictions.gbm_fullset) 
+
+#Check it looks correct
+head(submission_table)
+```
+Output the table to a csv file for submission:
+```{R}
+write.csv(submission_table, file = "submission.csv", row.names=FALSE)
+```
+
+###Conclusion and Summary
+
+The submitted file had a RMSLE of 0.128, coming in at the 70th percentile of submissions at the time of submission. There is scope for improvement with trialling additional models, ensembling more models together, or from further feature engineering.  
